@@ -1,0 +1,12 @@
+*.dSYM
+data/
+models/
+out/
+*.swp
+*.swo
+*~
+run
+runq
+*.bin
+__pycache__/
+.vscode/

@@ -24,6 +24,9 @@ class ModelArgs:
     dropout: float = 0.0
 
 
+# https://github.com/bzhangGo/rmsnorm
+# RMSNorm 根据均方根 (RMS) 对一层神经元的输入求和进行正则化，从而赋予模型重新缩放不变性和隐式学习率自适应能力。
+# RMSNorm 计算更简单，因此比 LayerNorm 更高效。
 class RMSNorm(torch.nn.Module):
     def __init__(self, dim: int, eps: float):
         super().__init__()
@@ -53,6 +56,7 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor):
     shape = [d if i == 1 or i == ndim - 1 else 1 for i, d in enumerate(x.shape)]
     return freqs_cis.view(shape)
 
+# https://kexue.fm/archives/8265
 def apply_rotary_emb(
     xq: torch.Tensor,
     xk: torch.Tensor,
@@ -125,8 +129,9 @@ class Attention(nn.Module):
     ):
         bsz, seqlen, _ = x.shape
 
-        # QKV
+        # QKV self-attention
         xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+
         xq = xq.view(bsz, seqlen, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seqlen, self.n_local_kv_heads, self.head_dim)
@@ -143,18 +148,29 @@ class Attention(nn.Module):
         xk = xk.transpose(1, 2)
         xv = xv.transpose(1, 2)
 
-        # flash implementation
+        # self-attention 机制用于计算序列中当前token关注与其他token的联系，
+        # 就是一个序列内的token，互相看其他token对自己的影响力有多大
+        # 通过计算Query和各个Key的相似性或者相关性，得到每个Key对应Value的权重系数，然后对Value进行加权求和，即得到了最终的Attention数值。所以本质上Attention机制是对Source中元素的Value值进行加权求和，而Query和Key用来计算对应Value的权重系数。
         if self.flash:
+            # flash implementation
+            # https://github.com/Dao-AILab/flash-attention
             output = torch.nn.functional.scaled_dot_product_attention(xq, xk, xv, attn_mask=None, dropout_p=self.dropout if self.training else 0.0, is_causal=True)
         else:
             # manual implementation
             scores = torch.matmul(xq, xk.transpose(2, 3)) / math.sqrt(self.head_dim)
             assert hasattr(self, 'mask')
             scores = scores + self.mask[:, :, :seqlen, :seqlen]   # (bs, n_local_heads, seqlen, cache_len + seqlen)
+            # Softmax的含义就在于不再唯一的确定某一个最大值，而是为每个输出分类的结果都赋予一个概率值，表示属于每个类别的可能性(权重)。
             scores = F.softmax(scores.float(), dim=-1).type_as(xq)
+            # https://zhuanlan.zhihu.com/p/390990848
+            # dropout 解决过拟合
+            # 训练神经网络的时候经常会遇到过拟合的问题，过拟合具体表现在：模型在训练数据上损失函数较小，预测准确率较高；但是在测试数据上损失函数比较大，预测准确率较低
+            # Dropout说的简单一点就是：我们在前向传播的时候，让某个神经元的激活值以一定的概率p停止工作，这样可以使模型泛化性更强，因为它不会太依赖某些局部的特征，
             scores = self.attn_dropout(scores)
+            # 点积：加权求和 -> attention 值
             output = torch.matmul(scores, xv)  # (bs, n_local_heads, seqlen, head_dim)
 
+        # MHA/GQA concat heads
         # restore time as batch dimension and concat heads
         output = output.transpose(1, 2).contiguous().view(bsz, seqlen, -1)
 
@@ -198,7 +214,15 @@ class TransformerBlock(nn.Module):
         self.ffn_norm = RMSNorm(args.dim, eps=args.norm_eps)
 
     def forward(self, x, freqs_cos, freqs_sin):
+        # residual connection
+        # https://zh-v2.d2l.ai/chapter_convolutional-modern/resnet.html
+        # https://en.wikipedia.org/wiki/Residual_neural_network
+        # 在传统的神经网络中，每个层的输出都是通过对前一层输出的非线性变换得到的。但是，当网络的深度增加时，前一层的输出可能会被过度压缩或拉伸，导致信息丢失或重复。这种情况下，网络的性能可能会受到影响，同时也会出现梯度消失或梯度爆炸的问题。
+        # 残差连接（residual connection）是深度神经网络中的一种常见技术，它的作用是解决梯度消失和梯度爆炸问题，同时也可以帮助模型更快地收敛。
+        # 残差连接通过在每个层的输出与输入之间添加一个跨层连接来解决这个问题。更具体地说，残差连接将前一层的输出直接添加到当前层的输出中，从而提供了一种绕过非线性变换的路径。这样，网络就可以学习到在信息压缩或拉伸后保留重要信息的方法，同时也减轻了梯度消失或梯度爆炸的问题。
+        # attention residual connection
         h = x + self.attention.forward(self.attention_norm(x), freqs_cos, freqs_sin)
+        # ffn residual connection
         out = h + self.feed_forward.forward(self.ffn_norm(h))
         return out
 
@@ -212,6 +236,13 @@ class Transformer(nn.Module):
         self.vocab_size = params.vocab_size
         self.n_layers = params.n_layers
 
+        # embedding 把数据集合映射到向量空间，进而把数据进行向量化的过程
+        # 将稀疏向量转化为稠密向量，便于上层神经网络的处理
+        # 在训练的过程中 找到一组合适的向量，来刻画现有的数据集合
+        # 将客观世界中的物体不失真的映射到高维特征空间中，进而可以使用这些embedding向量 实现分类、回归和预测等操作
+        # 详细介绍：
+        # https://mp.weixin.qq.com/s/FsqCNPtDPMdH0WGI0niELw
+        # https://vickiboykis.com/what_are_embeddings/
         self.tok_embeddings = nn.Embedding(params.vocab_size, params.dim)
         self.dropout = nn.Dropout(params.dropout)
         self.layers = torch.nn.ModuleList()
@@ -248,18 +279,24 @@ class Transformer(nn.Module):
 
     def forward(self, tokens: torch.Tensor, targets: Optional[torch.Tensor] = None) -> torch.Tensor:
         _bsz, seqlen = tokens.shape
+        # 1. token embedding
         h = self.tok_embeddings(tokens)
         h = self.dropout(h)
         freqs_cos = self.freqs_cos[:seqlen]
         freqs_sin = self.freqs_sin[:seqlen]
 
+        # 2. transformer decoder layers
         for layer in self.layers:
             h = layer(h, freqs_cos, freqs_sin)
+
+        # 3. Normalization
         h = self.norm(h)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
+            # 4. linear layer
             logits = self.output(h)
+            # 交叉熵的目的是获取输出概率（P）并测量与真值的距离
             self.last_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the output on the very last position

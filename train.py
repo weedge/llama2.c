@@ -5,6 +5,9 @@ and also in a larger training run with distributed data parallel (ddp).
 To run on a single GPU small debug run, example:
 $ python -m train.py --compile=False --eval_iters=10 --batch_size=8
 
+To run on a CPU small debug run, example:
+$ python -m train.py --compile=False --eval_iters=1 --batch_size=8 --device_type=cpu
+
 To run with DDP on 4 gpus on 1 node, example:
 $ torchrun --standalone --nproc_per_node=4 train.py
 
@@ -185,15 +188,19 @@ elif init_from == "resume":
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
+# torch.cuda.amp.GradScaler 是一个用于自动混合精度训练的 PyTorch 工具，它可以帮助加速模型训练并减少显存使用量。具体来说，GradScaler 可以将梯度缩放到较小的范围，以避免数值下溢或溢出的问题，同时保持足够的精度以避免模型的性能下降。
 scaler = torch.cuda.amp.GradScaler(enabled=(dtype == "float16"))
 
-# optimizer
+# optimizer AdamW 
+# 见论文：Decoupled Weight Decay Regularization
+# https://arxiv.org/abs/1711.05101
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
 if init_from == "resume" and "optimizer" in checkpoint:
     optimizer.load_state_dict(checkpoint["optimizer"])
 checkpoint = None  # free up memory
 
 # compile the model
+# torch.compile 通过 JIT 将 PyTorch 代码编译成优化的内核，使 PyTorch 代码运行得更快
 if compile:
     print("compiling the model... (takes a ~minute)")
     unoptimized_model = model
@@ -212,9 +219,11 @@ if ddp:
 def estimate_loss():
     out = {}
     model.eval()
+    # 分别对训练集和验证集进行估计
     for split in ["train", "val"]:
         batch_iter = iter_batches(split=split)
         losses = torch.zeros(eval_iters)  # keep on CPU
+        # 遍历每批次模型的losses, 对每批次losses算均值loss
         for k in range(eval_iters):
             X, Y = next(batch_iter)
             with ctx:
@@ -275,6 +284,7 @@ while True:
                 )
             except Exception as e:
                 print(f"logging to wandb failed: {e}")
+        # loss值变小则保存模型
         if losses["val"] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses["val"]
             if iter_num > 0:
@@ -308,13 +318,18 @@ while True:
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = next(train_batch_iter)
         # backward pass, with gradient scaling if training in fp16
+        # 调用 GradScaler 的 backward() 方法计算梯度并缩放
+        # 根据前向传播计算的loss值， 反向传播 更新模型参数权重
+        # 例子看下这个：https://zhuanlan.zhihu.com/p/447113449
         scaler.scale(loss).backward()
     # clip the gradient
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
     # step the optimizer and scaler if training in fp16
+    # 调用 scaler.step(optimizer) 来更新模型参数
     scaler.step(optimizer)
+    # 使用 scaler.update() 更新 GradScaler 对象的内部状态
     scaler.update()
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)

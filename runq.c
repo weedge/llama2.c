@@ -279,6 +279,9 @@ void free_transformer(Transformer* t) {
 // ----------------------------------------------------------------------------
 // neural net blocks; the dynamics of the Transformer
 
+// https://github.com/karpathy/llama2.c/issues/20 讨论了编译器选项，以及cpu向量化对推理的加速
+// 可以结合gcc/clang 编译器的文档
+// https://lemire.me/blog/2018/07/25/it-is-more-complicated-than-i-thought-mtune-march-in-gcc/
 void rmsnorm(float* o, float* x, float* weight, int size) {
     // calculate sum of squares
     float ss = 0.0f;

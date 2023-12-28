@@ -179,6 +179,13 @@ void free_transformer(Transformer* t) {
 // ----------------------------------------------------------------------------
 // neural net blocks; the dynamics of the Transformer
 
+// https://github.com/karpathy/llama2.c/issues/20 讨论了编译器选项，以及cpu向量化对推理的加速
+// 可以结合gcc/clang 编译器的文档
+// https://lemire.me/blog/2018/07/25/it-is-more-complicated-than-i-thought-mtune-march-in-gcc/
+
+// https://github.com/bzhangGo/rmsnorm
+// RMSNorm 根据均方根 (RMS) 对一层神经元的输入求和进行正则化，从而赋予模型重新缩放不变性和隐式学习率自适应能力。
+// RMSNorm 计算更简单，因此比 LayerNorm 更高效。
 void rmsnorm(float* o, float* x, float* weight, int size) {
     // calculate sum of squares
     float ss = 0.0f;
@@ -193,6 +200,10 @@ void rmsnorm(float* o, float* x, float* weight, int size) {
         o[j] = weight[j] * (ss * x[j]);
     }
 }
+
+// https://en.wikipedia.org/wiki/Softmax_function
+// Softmax的含义就在于不再唯一的确定某一个最大值，而是为每个输出分类的结果都赋予一个概率值，表示属于每个类别的可能性。
+// :math:`\text{Softmax}(x_{i}) = \frac{\exp(x_i)}{\sum_j \exp(x_j)}`
 
 void softmax(float* x, int size) {
     // find max value (for numerical stability)
@@ -214,6 +225,9 @@ void softmax(float* x, int size) {
     }
 }
 
+
+// 相似度函数 点积 , 
+// 输入 x 与 已训练的模型 linear层各 feature权重向量 的点积 
 void matmul(float* xout, float* x, float* w, int n, int d) {
     // W (d,n) @ x (n,) -> xout (d,)
     // by far the most amount of time is spent inside this little function
@@ -228,6 +242,7 @@ void matmul(float* xout, float* x, float* w, int n, int d) {
     }
 }
 
+// transformer forward pass
 float* forward(Transformer* transformer, int token, int pos) {
 
     // a few convenience variables
@@ -246,22 +261,31 @@ float* forward(Transformer* transformer, int token, int pos) {
     memcpy(x, content_row, dim*sizeof(*x));
 
     // forward all the layers
+    // TransformerBlock * n_layers
+    // attention all u need: https://arxiv.org/pdf/1706.03762.pdf
+    // see detail
     for(unsigned long long l = 0; l < p->n_layers; l++) {
 
         // attention rmsnorm
         rmsnorm(s->xb, x, w->rms_att_weight + l*dim, dim);
 
         // key and value point to the kv cache
+        // https://medium.com/@joaolages/kv-caching-explained-276520203249
+        // https://zhuanlan.zhihu.com/p/624740065
         int loff = l * p->seq_len * kv_dim; // kv cache layer offset for convenience
+        // concat
         s->k = s->key_cache + loff + pos * kv_dim;
         s->v = s->value_cache + loff + pos * kv_dim;
 
         // qkv matmuls for this position
+        // use kv cache gemm(General Matrix Multiplication)变为gemv操作
         matmul(s->q, s->xb, w->wq + l*dim*dim, dim, dim);
         matmul(s->k, s->xb, w->wk + l*dim*kv_dim, dim, kv_dim);
         matmul(s->v, s->xb, w->wv + l*dim*kv_dim, dim, kv_dim);
 
         // RoPE relative positional encoding: complex-valued rotate q and k in each head
+        // ROFORMER: ENHANCED TRANSFORMER WITH ROTARY POSITION EMBEDDING:
+        // https://arxiv.org/pdf/2104.09864v5.pdf
         for (int i = 0; i < dim; i+=2) {
             int head_dim = i % head_size;
             float freq = 1.0f / powf(10000.0f, head_dim / (float)head_size);
@@ -278,7 +302,12 @@ float* forward(Transformer* transformer, int token, int pos) {
             }
         }
 
-        // multihead attention. iterate over all heads
+        // MHA: multihead attention. iterate over all heads -> GQA: Grouped-Query Attention(llama2)
+        // MHA简单来说就是通过多次线性投影linear projection得到原始输入的多个子空间，然后再每个子空间分别进行SDPA(Scaled Dot-Product Attention), 再把SDPA的结果进行聚合Concatenation,最后再做一个linear projection。
+        // SDPA的全称为Scaled Dot-Product Attention, 属于点积注意力机制， 简单一句话来说就是，根据Query (Q)与Key之间的匹配度来对Value进行加权，而事实上不管是Query, Key还是Value都来自于输入，因此所谓的SDPA本质上是对输入信息信息进行重组。
+        // 通过计算Query和各个Key的相似性或者相关性，得到每个Key对应Value的权重系数，然后对Value进行加权求和，即得到了最终的Attention数值。所以本质上Attention机制是对Source中元素的Value值进行加权求和，而Query和Key用来计算对应Value的权重系数。
+        // self-attention 机制用于计算序列中当前token关注与其他token的联系，
+        // 就是一个序列内的token，互相看其他token对自己的影响力有多大
         int h;
         #pragma omp parallel for private(h)
         for (h = 0; h < p->n_heads; h++) {
@@ -318,25 +347,39 @@ float* forward(Transformer* transformer, int token, int pos) {
             }
         }
 
-        // final matmul to get the output of the attention
+        // final matmul to get the output of the attention with o_proj weights
         matmul(s->xb2, s->xb, w->wo + l*dim*dim, dim, dim);
 
         // residual connection back into x
+        // https://zh-v2.d2l.ai/chapter_convolutional-modern/resnet.html
+        // https://en.wikipedia.org/wiki/Residual_neural_network
+        // 在传统的神经网络中，每个层的输出都是通过对前一层输出的非线性变换得到的。但是，当网络的深度增加时，前一层的输出可能会被过度压缩或拉伸，导致信息丢失或重复。这种情况下，网络的性能可能会受到影响，同时也会出现梯度消失或梯度爆炸的问题。
+        // 残差连接（residual connection）是深度神经网络中的一种常见技术，它的作用是解决梯度消失和梯度爆炸问题，同时也可以帮助模型更快地收敛。
+        // 残差连接通过在每个层的输出与输入之间添加一个跨层连接来解决这个问题。更具体地说，残差连接将前一层的输出直接添加到当前层的输出中，从而提供了一种绕过非线性变换的路径。这样，网络就可以学习到在信息压缩或拉伸后保留重要信息的方法，同时也减轻了梯度消失或梯度爆炸的问题。
         for (int i = 0; i < dim; i++) {
             x[i] += s->xb2[i];
         }
 
         // ffn rmsnorm
+        // x为attention层的输出 与 训练好的权重 进行rmsnorm归一化缩放，
+        // 隐藏状态写入s->xb中, s->xb作为 FFN 的输入
         rmsnorm(s->xb, x, w->rms_ffn_weight + l*dim, dim);
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
+        // w1 is gate_projection
         matmul(s->hb, s->xb, w->w1 + l*dim*hidden_dim, dim, hidden_dim);
+        // w3 is up_projection
         matmul(s->hb2, s->xb, w->w3 + l*dim*hidden_dim, dim, hidden_dim);
 
         // SwiGLU non-linearity
+        // GLU（Gated Linear Units）其实不算是一种激活函数，而是一种神经网络层。它是一个线性变换后面接门控机制的结构。其中门控机制是一个sigmoid激活函数用来控制信息能够通过多少
+        // https://en.wikipedia.org/wiki/Sigmoid_function
+        // SwiGLU其实就是采用Swish作为激活函数的GLU变体, 加入了一个参数更加丝滑
+        // https://en.wikipedia.org/wiki/Swish_function like sigmoid
         for (int i = 0; i < hidden_dim; i++) {
             float val = s->hb[i];
+            // Sigmoid Linear Unit (SiLU) 
             // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
             val *= (1.0f / (1.0f + expf(-val)));
             // elementwise multiply with w3(x)
@@ -345,24 +388,32 @@ float* forward(Transformer* transformer, int token, int pos) {
         }
 
         // final matmul to get the output of the ffn
+        // 输入 s->hb 与 权重 w2 down_projection 进行gemv, 
+        // 隐藏状态写入s->xb中, s->xb作为 残差连接 的输入
         matmul(s->xb, s->hb, w->w2 + l*dim*hidden_dim, hidden_dim, dim);
 
         // residual connection
+        // 残差连接输出的x 作为下一层的输入
         for (int i = 0; i < dim; i++) {
             x[i] += s->xb[i];
         }
     }
 
     // final rmsnorm
+    // 最终 n*TransformerBlock 处理的结果与训练好的权重进行rmsnorm归一化缩放，
+    // 计算结果写入x中
     rmsnorm(x, x, w->rms_final_weight, dim);
 
     // classifier into logits
+    // 输入 x 与 权重 wcls 进行 gemv, 
+    // 得到模型最终输出 logits (vocab_size) vector
     matmul(s->logits, x, w->wcls, p->dim, p->vocab_size);
     return s->logits;
 }
 
 // ----------------------------------------------------------------------------
 // The Byte Pair Encoding (BPE) Tokenizer that translates strings <-> tokens
+// https://leimao.github.io/blog/Byte-Pair-Encoding/
 
 typedef struct {
     char *str;
@@ -475,6 +526,10 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
     // add optional BOS (=1) token, if desired
     if (bos) tokens[(*n_tokens)++] = 1;
 
+    // 从已经加载的训练好的词表里获取单个词对应token id
+    // 更多实现见 https://github.com/google/sentencepiece
+    // https://arxiv.org/abs/1808.06226
+
     // add_dummy_prefix is true by default
     // so prepend a dummy prefix token to the input string, but only if text != ""
     // TODO: pretty sure this isn't correct in the general case but I don't have the
@@ -533,6 +588,7 @@ void encode(Tokenizer* t, char *text, int8_t bos, int8_t eos, int *tokens, int *
         str_len = 0; // protect against a sequence of stray UTF8 continuation bytes
     }
 
+    // bpe 算法
     // merge the best consecutive pair each iteration, according the scores in vocab_scores
     while (1) {
         float best_score = -1e10;
@@ -725,7 +781,7 @@ long time_in_ms() {
 
 // ----------------------------------------------------------------------------
 // generation loop
-
+// https://huggingface.co/blog/how-to-generate
 void generate(Transformer *transformer, Tokenizer *tokenizer, Sampler *sampler, char *prompt, int steps) {
     char *empty_prompt = "";
     if (prompt == NULL) { prompt = empty_prompt; }
